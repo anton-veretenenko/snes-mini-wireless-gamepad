@@ -20,8 +20,10 @@
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "driver/i2c.h"
 
 static void espnow_task(void *);
+static void gamepads_update(void);
 static uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 #define IS_BROADCAST_ADDR(addr) (memcmp(addr, s_broadcast_mac, ESP_NOW_ETH_ALEN) == 0)
 
@@ -33,7 +35,17 @@ static uint8_t s_mac_gamepads[ESP_NOW_ETH_ALEN] = { 0x84, 0xf7, 0x03, 0xd7, 0xc5
 static uint8_t s_mac_receiver[ESP_NOW_ETH_ALEN] = { 0x84, 0xf7, 0x03, 0xd7, 0xb4, 0x98 };
 #define ESPNOW_PMK "pmk12345"
 #define ESPNOW_LMK "lmk12345"
-static int btn_prev = 0;
+int btn_prev = 0;
+
+#define I2C_LEFT_SCL 35
+#define I2C_LEFT_SDA 33
+#define I2C_LEFT_PORT I2C_NUM_0
+#define I2C_CLOCK 100000
+#define GAMEPAD_ADDR 0x52
+
+bool gamepad_left_connected = false;
+bool gamepad_right_connected = false;
+static uint8_t gamepad_left_buf[6] = { 0x00 };
 
 // gamepads mac: 84:f7:03:d7:c5:9e
 // recevier mac: 84:f7:03:d7:b4:98
@@ -179,6 +191,56 @@ static void espnow_deinit(void)
     esp_now_deinit();
 }
 
+static void gamepads_update(void)
+{
+    static uint8_t init_buf1[2] = { 0xF0, 0x55 };
+    static uint8_t init_buf2[2] = { 0xFB, 0x00 };
+    static uint8_t btn_read_cmd[1] = { 0x00 };
+    static uint8_t btn_buf[6] = { 0x00 };
+    esp_err_t err;
+    if (!gamepad_left_connected) {
+        // init left gamepad
+        // uint8_t buf1[2] = { 0x40, 0x00 };
+        err = i2c_master_write_to_device(
+            I2C_LEFT_PORT, GAMEPAD_ADDR,
+            init_buf1, sizeof(init_buf1),
+            8 / portTICK_PERIOD_MS
+        );
+        ESP_LOGI(TAG, "I2C Left init ret 1: %d", err);
+        if (err == ESP_OK) {
+            err = i2c_master_write_to_device(
+                I2C_LEFT_PORT, GAMEPAD_ADDR,
+                init_buf2, sizeof(init_buf2),
+                8 / portTICK_PERIOD_MS
+            );
+            ESP_LOGI(TAG, "I2C Left init ret 2: %d", err);
+            if (err == ESP_OK) {
+                gamepad_left_connected = true;
+            }
+        }
+    }
+    if (gamepad_left_connected) {
+        // read left gamepad buttons
+        err = i2c_master_write_read_device(
+            I2C_LEFT_PORT, GAMEPAD_ADDR,
+            btn_read_cmd, sizeof(btn_read_cmd),
+            btn_buf, sizeof(btn_buf),
+            8 / portTICK_PERIOD_MS
+        );
+        if (err == ESP_OK) {
+            // print buttons buf
+            if (memcmp(btn_buf, gamepad_left_buf, sizeof(btn_buf)) != 0) {
+                // send new data
+                memcpy(gamepad_left_buf, btn_buf, sizeof(btn_buf));
+                esp_now_send(s_mac_receiver, gamepad_left_buf, sizeof(gamepad_left_buf));
+                ESP_LOGI(TAG, "Left: btn buf: %02x %02x %02x %02x %02x %02x", btn_buf[0], btn_buf[1], btn_buf[2], btn_buf[3], btn_buf[4], btn_buf[5]);
+            }
+        } else {
+            ESP_LOGE(TAG, "Left: read err %d", err);
+        }
+    }
+}
+
 static void espnow_task(void *)
 {
     espnow_event_t evt;
@@ -200,6 +262,19 @@ static void espnow_task(void *)
                 //     espnow_deinit();
                 //     vTaskDelete(NULL);
                 // }
+
+                // for (int i = 0; i < 128; i++) {
+                //     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+                //     i2c_master_start(cmd);
+                //     i2c_master_write_byte(cmd, (i << 1) | I2C_MASTER_WRITE, true);
+                //     i2c_master_stop(cmd);
+                //     err = i2c_master_cmd_begin(I2C_LEFT_PORT, cmd, 50 / portTICK_PERIOD_MS);
+                //     i2c_cmd_link_delete(cmd);
+                //     if (err == ESP_OK) {
+                //         ESP_LOGI(TAG, "Found: %02x", i);
+                //     }
+                // }
+
             } else {
                 ESP_LOGI(TAG, "Received data from "MACSTR" data: %02x %02x", MAC2STR(evt.mac_addr), evt.data[0], evt.data[1]);
                 gpio_set_level(GPIO_NUM_15, 1);
@@ -216,6 +291,7 @@ static void espnow_task(void *)
             buf[0] = btn_prev & 0xff;
             esp_now_send(s_mac_receiver, buf, sizeof(buf));
         }
+        gamepads_update();
     }
 }
 
@@ -242,11 +318,26 @@ static void gpio_init(void)
     gpio_config(&io_conf);
 }
 
+static void i2c_init(void)
+{
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_LEFT_SDA,
+        .scl_io_num = I2C_LEFT_SCL,
+        .sda_pullup_en = true,
+        .scl_pullup_en = true,
+        .master.clk_speed = I2C_CLOCK
+    };
+    i2c_param_config(I2C_LEFT_PORT, &conf);
+    ESP_ERROR_CHECK( i2c_driver_install(I2C_LEFT_PORT, conf.mode, 0, 0, 0) );
+}
+
 void app_main(void)
 {  
     esp_log_level_set(TAG, ESP_LOG_VERBOSE);
 
     gpio_init();
+    i2c_init();
     gpio_set_level(GPIO_NUM_15, 1);
     vTaskDelay(300 / portTICK_PERIOD_MS);
     gpio_set_level(GPIO_NUM_15, 0);
