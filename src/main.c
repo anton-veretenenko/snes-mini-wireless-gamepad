@@ -390,7 +390,8 @@ static void i2c_init_gamepads(void)
             .scl_pullup_en = true,
             .master.clk_speed = I2C_CLOCK,
             .slave.addr_10bit_en = 0,
-            .slave.slave_addr = GAMEPAD_ADDR
+            .slave.slave_addr = GAMEPAD_ADDR,
+            .slave.maximum_speed = I2C_CLOCK
         };
         i2c_param_config(I2C_LEFT_PORT, &conf_left);
         ESP_ERROR_CHECK( i2c_driver_install(I2C_LEFT_PORT, conf_left.mode, I2C_BUF_LEN, I2C_BUF_LEN, 0) );
